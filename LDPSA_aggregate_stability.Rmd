@@ -1,0 +1,207 @@
+---
+title: Assessing soil aggregate stability from laser diffraction particle size data with hierachical models
+author: M.G. Walsh and A. Sila
+date: "Last compiled: `r format(Sys.time(), '%d, %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+    css: style.css
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(message = FALSE)
+```
+
+# Introduction
+
+[Soil aggregate stability](https://www.sciencedirect.com/topics/agricultural-and-biological-sciences/aggregate-stability) refers to the ability of soil aggregates to resist disintegration when disruptive forces associated with e.g., tillage operations and erosion occur. Aggregate stability indicates how well soils can resist compaction, wind abrasion, rainfall detachment and atmospheric and/or overland transport. It is a dynamic structural soil property, which is important for water infiltration, retention and drainage, soil aeration, microbial activity, organic matter storage and stabilization and plant root growth, among others. When unstable soil aggregates disintegrate e.g., during tillage and/or rainstorms, dispersed particles fill soil pore spaces. Plow layer compaction, hardpans and soil crusts can develop. Once such structures are formed, infiltration is reduced, which can result in increased runoff, erosion and reduced water availability for plant growth. Typically, the associated processes will occur in reinforcing feedback loops in landscapes. Changes in aggregate stability can be used as early indicators of soil degradation or recovery and to monitor the effects and impacts of land management interventions. However, conventional approaches that use techiniques such as wet sieving and weighing or hydrometer methods are time consuming, labor intensive and expensive. This has largely precluded their operational use in large area assessment and monitoring applications. 
+
+[Laser diffraction particle size analysis (LDPSA)](https://wiki.anton-paar.com/en/laser-diffraction-for-particle-sizing/) under different dispersion treatments in e.g., in air, water and/or sodium hexametaphosphate, with or without [sonication](https://www.sciencedirect.com/topics/engineering/sonication) can serve as indicators of soil particle size distributions and aggregate stability for environmental and engineering purposes. The big adavntage of LDPSA is that it can be performed rapidly (in <5 minutes) using small (<5 g) quantities of soil. The method works by passing a representative sample of soil particles through a laser beam, which scatters the incident light onto a Fourier lens. The lens focuses the scattered light onto a detector array using an inversion algorithm, and a particle size distribution is inferred from the collected data. [Mie theory](https://en.wikipedia.org/wiki/Mie_scattering) is applied to provide a compositionally-based distribution of particle sizes based on the correlation between the intensity and the angle of the light that is scattered.
+
+*The main goal of this notebook is to illustrate starter code for assessing soil aggregate stability in landscapes. It does not go into the details of LDPSA data collections or the associated laboratory procedures. Instead, it focuses on the associated statistical workflows that are needed to generate potentially useful inferences and predictions from populations of LDPSA measurements. We apply [Multilevel](http://www.stat.columbia.edu/~gelman/arm/) models for exploratory analyses and subsequently [Hierarchical Bayesian](https://www.bayesrulesbook.com/) models for inference and prediction here. Hierarchical models (Bayesian or otherwise) are still not widely used in soil science, where they could be applied in a wide variety of practical use-case settings.*
+
+# Data setup
+
+To actually run this notebook, you will need to load the packages indicated in the chunk directly below. The notebook itself is maintained on [Github](), and you can fork and modify it from there as you see fit. There will be additional packages that will be need to be loaded to run the Hierarchical Bayesian models presented in a later section of this notebook. These will require more customized procedures for installation. We shall deal with those issues in the relevant sections below.
+
+```{r}
+# Package names
+packages <- c("osfr", "tidyverse", "compositions", "leaflet", "ggplot2", "ggtern", "quantreg", "arm")
+
+# Install packages
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+# Load packages
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+The next chunk downloads the data needed for running this example. We shall use topsoil (0-20 cm) and co-located subsoil (20-50 cm) data that were collected as part of the AfSIS project, which were sampled in 60, 10 × 10 km  sentinel landscapes [(see e.g., Vagen et. al., 2015)](https://www.sciencedirect.com/science/article/pii/S0016706115300082) in proportion to their occurrence in the major [Köppen-Geiger](http://koeppen-geiger.vu-wien.ac.at/) climate zones of Africa excluding deserts, urban and other non-photosynthetically active land areas. Each sentinel site represents a 100 km^2^ area, with a total of 160 soil profile sampling locations within each sentinel landscape. A randomly selected ~10% subset (n = 943/9600) of soil profiles were analyzed with LDPSA.
+
+```{r, results = 'hide'}
+# Create a data folder in your current working directory
+dir.create("ldpsa", showWarnings = F)
+setwd("./ldpsa")
+dir.create("Results", showWarnings = F)
+
+# LDPSA data download from https://osf.io/yr8ua/
+osf_retrieve_file("yr8ua") %>% osf_download(conflicts = "overwrite")
+unzip("LDPSA_60.zip", overwrite = T)
+```
+
+The following chunk reads in the data, calculates calculates a Compositional Aggregate Stability Index (CASI), which will be the main variable (label) that is used to describe soil aggregate stability in this notebook. It also loads additional covariates including: the available water storage capacity, pH, electrical conductivity, cation exchange capacity and soil organic carbon levels of each soil sample.
+
+```{r}
+ldpsa <- read.table("./ldpsa/LDPSA_60.csv", header=T, sep=",")
+covar <- read.table("./ldpsa/LDPSA_covar.csv", header=T, sep=",")
+
+# Calculate centered log ratios (CLR)
+ldpsa <- subset(ldpsa, disp == "calgon" | disp == "water")
+varc <- c("sand", "silt", "clay")
+comp <- ldpsa[varc]
+comp <- comp / rowSums(comp) ## close the composition
+comp <- as.data.frame(clr(comp)) ## centered log ratio (clr) transform
+names(comp) <- c("csand", "csilt", "cclay")
+ldpsa <- cbind(ldpsa, comp)
+
+# Calculate the compositional aggregate stability index (CASI)
+ref <- subset(ldpsa, trt == "c4", select = c("ssid", "csand", "csilt", "cclay"))
+names(ref) <- c("ssid", "rsand", "rsilt", "rclay")
+ldpsa <- merge(ldpsa, ref, by = "ssid")
+ldpsa$casi <- (ldpsa$csand-ldpsa$rsand) + (ldpsa$csilt-ldpsa$rsilt) + (ldpsa$csilt-ldpsa$rsilt)
+
+# Link up the relevant covariates
+ldpsa <- merge(ldpsa, covar, by = "ssid")
+```
+
+# Data profiling
+
+## Spatial distribution of soil sampling locations
+
+```{r}
+loc <- subset(ldpsa, trt == "c4", select=c(ssid, lat, lon)) ## reference soil sample locations
+
+# Soil sample locations
+w <- leaflet() %>%
+  setView(lng = mean(loc$lon), lat = mean(loc$lat), zoom = 4) %>%
+  addProviderTiles(providers$OpenStreetMap.Mapnik) %>%
+  addCircleMarkers(loc$lon, loc$lat, clusterOptions = markerClusterOptions())
+w ## plot widget 
+```
+
+## Soil texture fractions by treatment combinations
+
+```{r}
+water <- subset(ldpsa, disp == "water", select=c(sand, clay, silt, stime, casi)) 
+
+wtex_son <- ggtern(
+  data = water, aes(x = sand, y = clay, z = silt))+
+  geom_point(aes(color = stime), size= 1, alpha = 0.5)+
+  scale_color_continuous(low = "dodgerblue", high = "tomato")+
+  labs(color = "Sonication time (minutes)")+
+  theme_bw()+
+  theme(legend.justification = c(0, 1), 
+        legend.position      = c(0, 1))
+
+wtex_casi <- ggtern(
+  data = water, aes(x = sand, y = clay, z = silt))+
+  geom_point(aes(color = casi), size = 1, alpha = 0.5)+
+  scale_color_continuous(low="dodgerblue", high="tomato")+
+  labs(color="CASI")+
+  theme_bw()+
+  theme(legend.justification = c(0, 1), 
+        legend.position      = c(0, 1))
+```
+
+Note that an identical chunk is replicated for the samples that were dispersed in Calgon. This is not included in the html here to keep the text concise. However, it is included in the actual R-markdown doc on [Github](). This chunk generates the initial ternary plots using the `ggtern` package in R-markdown. The figures appear convincing in that in that as a whole they show that the particle dispersion in both water and Calgon work in the anticipated dispersion direction in response to the sonication treatments.
+
+```{r, echo = FALSE}
+calgon <- subset(ldpsa, disp == "calgon", select=c(sand, clay, silt, stime, casi))
+
+ctex_son <- ggtern(
+  data = calgon, aes(x = sand, y = clay, z = silt))+
+  geom_point(aes(color = stime), size= 1, alpha = 0.5)+
+  scale_color_continuous(low = "dodgerblue", high = "tomato")+
+  labs(color = "Sonication time (minutes)")+
+  theme_bw()+
+  theme(legend.justification = c(0, 1), 
+        legend.position      = c(0, 1))
+
+ctex_casi <- ggtern(
+  data = calgon, aes(x = sand, y = clay, z = silt))+
+  geom_point(aes(color = casi), size = 1, alpha = 0.5)+
+  scale_color_continuous(low="dodgerblue", high="tomato")+
+  labs(color="CASI")+
+  theme_bw()+
+  theme(legend.justification = c(0, 1), 
+        legend.position      = c(0, 1))
+```
+
+```{r, echo = FALSE, fig.align = "center", fig.show = 'hold', out.width = "50%", fig.cap = "Ternary plots of the particle size distributions of LDPSA samples dispersed in either in water (top) or sodium hexametaphosphate (Calgon, bottom). Color coded by sonication time (`stime`, left), and aggregate stability index (`casi`, right)."}
+
+wtex_son
+wtex_casi
+ctex_son
+ctex_casi
+```
+
+## Compositional aggregate stability index (CASI) distributions
+
+```{r, fig.align = "center", fig.show = 'hold', out.width = "50%", fig.cap = "Boxplots of aggregate stability index (CASI) distributions of samples dispersed in water (left) or sodium hexametaphosphate (right) by sonication times."}
+
+par(pty = "s")
+boxplot(water$casi ~ water$stime, notch = T, ylab = "CASI in water",
+        xlab = "Sonication time (minutes)", cex.axis = 1, cex.lab = 1.3)
+boxplot(calgon$casi ~ calgon$stime, notch = T, ylab = "CASI in Calgon", 
+        xlab = "Sonication time (minutes)", cex.axis = 1, cex.lab = 1.3)
+```
+
+## Extreme value labeling
+
+```{r, results = 'hide', warning = FALSE}
+# Quantile regression fit
+quant <- rq(casi~factor(topsub)+factor(disp)*stime, tau=c(0.05,0.95), data=ldpsa)
+
+# Generate EV labels
+preds <- as.data.frame(exp(predict(quant, ldpsa)))
+names(preds) <- c("lo", "hi")
+ldpsa <- cbind(ldpsa, preds)
+ldpsa <- ldpsa %>% mutate(evl = case_when(casi < lo | casi > hi ~ 'y', TRUE ~ 'n'))
+
+# Exclude EV labels
+water <- subset(ldpsa, disp == "water" & evl == "n", select=c(casi, stime))
+```
+
+```{r, echo = FALSE, fig.align = "center", fig.show = 'hold', out.width = "50%", fig.cap = "Boxplots of aggregate stability index distributions of samples dispersed in water (left) or sodium hexametaphosphate (right) by sonication times with EV removal."}
+
+par(pty = "s")
+boxplot(water$casi ~ water$stime, notch = T, ylab = "CASI",
+        xlab = "Sonication time (minutes)", cex.axis = 1, cex.lab = 1.3)
+```
+
+# Multilevel (ML) models
+
+```{r}
+# Baseline random intercepts model
+ml0 <- lmer(casi~I(depth/100)+disp*stime+(1|site/pid), data=ldpsa)
+
+# Extract site-level random effects and standard errors
+ml0.ranef <- ranef(ml0)
+ml0.se <- se.coef(ml0)
+
+summary(ml0)
+```
+
+```{r, echo = FALSE, fig.align = "center", fig.cap = "."}
+coefplot(ml0.ranef$site[,1], ml0.se$site[,1], varnames=rownames(ml0.ranef$site), xlim=c(-1,1), CI=2, 
+         cex.var=0.6, cex.pts=0.8, main="")
+```
+
+# Hierchical Bayes (HB) models
+
+
+# Takeaways
